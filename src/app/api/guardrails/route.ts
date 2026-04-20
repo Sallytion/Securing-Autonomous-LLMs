@@ -1,14 +1,31 @@
-import { Groq } from 'groq-sdk';
 import { NextRequest } from 'next/server';
 import { formatSanitizationSummary, sanitizePrompt } from '@/lib/promptSanitizer';
-
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
+import {
+  DEFAULT_PROMPT_GUARD_MODEL,
+  PROMPT_GUARD_MODELS,
+  resolvePromptGuardModelId,
+  scorePromptGuardText,
+} from '@/lib/promptGuardClient';
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
   const message = body?.message;
+  const requestedModelId = body?.modelId;
+
+  const resolvedModelId = resolvePromptGuardModelId(requestedModelId);
+  if (requestedModelId !== undefined && resolvedModelId === null) {
+    return new Response(
+      JSON.stringify({
+        error: `Invalid modelId. Allowed values: ${PROMPT_GUARD_MODELS.join(', ')}`,
+      }),
+      {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      }
+    );
+  }
+
+  const modelId = resolvedModelId ?? DEFAULT_PROMPT_GUARD_MODEL;
 
   if (!message || typeof message !== 'string') {
     return new Response(JSON.stringify({ error: 'Message is required' }), {
@@ -18,37 +35,37 @@ export async function POST(request: NextRequest) {
   }
 
   const sanitized = sanitizePrompt(message);
+  try {
+    const { riskScore } = await scorePromptGuardText(sanitized.sanitizedText, modelId);
 
-  const completion = await groq.chat.completions.create({
-    messages: [
+    return new Response(
+      JSON.stringify({
+        riskScore,
+        modelId,
+        sanitizedMessage: sanitized.sanitizedText,
+        sanitizationSummary: formatSanitizationSummary(sanitized),
+        sanitizationMeta: {
+          totalRedactions: sanitized.totalRedactions,
+          categoryCounts: sanitized.categoryCounts,
+          truncated: sanitized.truncated,
+        },
+      }),
       {
-        role: 'user',
-        content: sanitized.sanitizedText,
-      },
-    ],
-    model: 'meta-llama/llama-prompt-guard-2-22m',
-    temperature: 1,
-    max_completion_tokens: 1,
-    top_p: 1,
-    stream: false,
-    stop: null,
-  });
-
-  const riskScore = parseFloat(completion.choices[0]?.message?.content ?? '0') || 0;
-
-  return new Response(
-    JSON.stringify({
-      riskScore,
-      sanitizedMessage: sanitized.sanitizedText,
-      sanitizationSummary: formatSanitizationSummary(sanitized),
-      sanitizationMeta: {
-        totalRedactions: sanitized.totalRedactions,
-        categoryCounts: sanitized.categoryCounts,
-        truncated: sanitized.truncated,
-      },
-    }),
-    {
-      headers: { 'Content-Type': 'application/json' },
-    }
-  );
+        headers: { 'Content-Type': 'application/json' },
+      }
+    );
+  } catch (error) {
+    return new Response(
+      JSON.stringify({
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Prompt Guard request failed',
+      }),
+      {
+        status: 502,
+        headers: { 'Content-Type': 'application/json' },
+      }
+    );
+  }
 }

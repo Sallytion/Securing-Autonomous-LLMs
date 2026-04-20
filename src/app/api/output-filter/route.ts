@@ -1,9 +1,10 @@
-import { Groq } from 'groq-sdk';
 import { NextRequest } from 'next/server';
-
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
+import {
+  DEFAULT_PROMPT_GUARD_MODEL,
+  PROMPT_GUARD_MODELS,
+  resolvePromptGuardModelId,
+  scorePromptGuardText,
+} from '@/lib/promptGuardClient';
 
 const OUTPUT_FILTER_THRESHOLD = 0.5;
 const OUTPUT_FILTER_MAX_WORDS = 500;
@@ -30,6 +31,22 @@ function truncateForOutputFilter(text: string) {
 export async function POST(request: NextRequest) {
   const body = await request.json();
   const message = body?.message;
+  const requestedModelId = body?.modelId;
+
+  const resolvedModelId = resolvePromptGuardModelId(requestedModelId);
+  if (requestedModelId !== undefined && resolvedModelId === null) {
+    return new Response(
+      JSON.stringify({
+        error: `Invalid modelId. Allowed values: ${PROMPT_GUARD_MODELS.join(', ')}`,
+      }),
+      {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      }
+    );
+  }
+
+  const modelId = resolvedModelId ?? DEFAULT_PROMPT_GUARD_MODEL;
 
   if (!message || typeof message !== 'string') {
     return new Response(JSON.stringify({ error: 'Message is required' }), {
@@ -48,6 +65,7 @@ export async function POST(request: NextRequest) {
         allowed: true,
         truncated: false,
         wordsAnalyzed: 0,
+        modelId,
       }),
       {
         headers: { 'Content-Type': 'application/json' },
@@ -55,34 +73,35 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const completion = await groq.chat.completions.create({
-    messages: [
+  try {
+    const { riskScore } = await scorePromptGuardText(prepared.text, modelId);
+
+    return new Response(
+      JSON.stringify({
+        riskScore,
+        threshold: OUTPUT_FILTER_THRESHOLD,
+        allowed: riskScore <= OUTPUT_FILTER_THRESHOLD,
+        truncated: prepared.truncated,
+        wordsAnalyzed: Math.min(prepared.originalWordCount, OUTPUT_FILTER_MAX_WORDS),
+        originalWordCount: prepared.originalWordCount,
+        modelId,
+      }),
       {
-        role: 'user',
-        content: prepared.text,
-      },
-    ],
-    model: 'meta-llama/llama-prompt-guard-2-22m',
-    temperature: 1,
-    max_completion_tokens: 1,
-    top_p: 1,
-    stream: false,
-    stop: null,
-  });
-
-  const riskScore = parseFloat(completion.choices[0]?.message?.content ?? '0') || 0;
-
-  return new Response(
-    JSON.stringify({
-      riskScore,
-      threshold: OUTPUT_FILTER_THRESHOLD,
-      allowed: riskScore <= OUTPUT_FILTER_THRESHOLD,
-      truncated: prepared.truncated,
-      wordsAnalyzed: Math.min(prepared.originalWordCount, OUTPUT_FILTER_MAX_WORDS),
-      originalWordCount: prepared.originalWordCount,
-    }),
-    {
-      headers: { 'Content-Type': 'application/json' },
-    }
-  );
+        headers: { 'Content-Type': 'application/json' },
+      }
+    );
+  } catch (error) {
+    return new Response(
+      JSON.stringify({
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Prompt Guard request failed',
+      }),
+      {
+        status: 502,
+        headers: { 'Content-Type': 'application/json' },
+      }
+    );
+  }
 }
